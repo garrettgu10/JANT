@@ -7,7 +7,6 @@
 
 import ghidra.app.script.GhidraScript;
 import ghidra.app.util.PseudoDisassembler;
-import ghidra.app.util.PseudoInstruction;
 import ghidra.pcode.emulate.BreakTable;
 import ghidra.pcode.emulate.BreakTableCallBack;
 import ghidra.pcode.emulate.Emulate;
@@ -15,23 +14,14 @@ import ghidra.pcode.emulate.InstructionDecodeException;
 import ghidra.pcode.error.LowlevelError;
 import ghidra.pcode.memstate.MemoryState;
 import ghidra.pcode.pcoderaw.PcodeOpRaw;
-import ghidra.program.model.util.*;
 import ghidra.util.exception.CancelledException;
-import ghidra.util.task.ConsoleTaskMonitor;
 import ghidra.util.task.TaskMonitor;
-import ghidra.program.model.reloc.*;
-import ghidra.program.model.data.*;
-import ghidra.program.model.block.*;
-import ghidra.program.model.symbol.*;
-import ghidra.program.model.mem.*;
 import ghidra.program.model.listing.*;
-import ghidra.program.model.lang.*;
 import ghidra.program.model.pcode.*;
 import ghidra.program.model.address.*;
 
 import java.math.BigInteger;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.TreeSet;
 
@@ -140,17 +130,14 @@ public class TestScript extends GhidraScript {
 				}
 				
 				if(this.raiseDitViolations && this.currInstrType != InstrType.DIT) {
-					println("DIT VIOLATION");
+					println("DIT VIOLATION DETECTED");
 					ditViolationDetected = true;
 				}
 			}
-			
-			printf("read  %s %x (%d) %d\n", spc.toString(), off, size, this.tainted? 1: 0);
 		}
 
 		@Override
 		protected void processWrite(AddressSpace spc, long off, int size, byte[] values) {
-			printf("write %s %x (%d) %d\n", spc.toString(), off, size, this.tainted? 1: 0);
 			if(this.tainted) {
 				this.taint(spc, off, size);
 			}else {
@@ -176,7 +163,6 @@ public class TestScript extends GhidraScript {
 		@Override
 		public void executeInstruction(boolean stopAtBreakpoint, TaskMonitor monitor1) throws CancelledException, LowlevelError, InstructionDecodeException {
     		Address pcAddr = this.getExecuteAddress();
-    		printf("PC: %x\n", pcAddr.getOffset());
     		
     		byte[] instrBytes = new byte[MAX_INSTR_LENGTH];
     		
@@ -203,8 +189,7 @@ public class TestScript extends GhidraScript {
 			super.executeInstruction(stopAtBreakpoint, monitor1);
 		}
 		
-		
-		// we must override the load and store pcode ops since the ARM manual is specific that loads/stores are DIT wrt the values being loaded/stored
+		//a direct copy of overloaded functions, except the addresses are explicitly checked for DIT violations
 		@Override
 		public void executeLoad(PcodeOpRaw op) {
 
@@ -236,7 +221,6 @@ public class TestScript extends GhidraScript {
 			}
 		}
 		
-		// we must override the load and store pcode ops since the ARM manual is specific that loads/stores are DIT wrt the values being loaded/stored
 		@Override
 		public void executeStore(PcodeOpRaw op) {
 			
@@ -291,10 +275,10 @@ public class TestScript extends GhidraScript {
     	Emulator emu = emuHelper.getEmulator();
     	emuHelper.writeRegister(emuHelper.getPCRegister(), currentAddress.getOffset());
     	emuHelper.writeRegister(emuHelper.getStackPointerRegister(), 0x000000002FFF0000);
-    	emuHelper.writeRegister("x0", 0x420000);
-    	emuHelper.writeRegister("x1", 42);
-    	Address taintedRegAddr = emuHelper.getLanguage().getRegister("x1").getAddress();
-    	taintTrack.taint(taintedRegAddr.getAddressSpace(), taintedRegAddr.getOffset(), taintedRegAddr.getSize());
+    	emuHelper.writeRegister("x0", 42);
+    	emuHelper.writeRegister("x1", 50);
+    	Address taintedRegAddr = emuHelper.getLanguage().getRegister("x0").getAddress();
+    	taintTrack.taint(taintedRegAddr.getAddressSpace(), taintedRegAddr.getOffset(), 8);
 
     	taintTrack.setFilterOnExecutionOnly(false);
 
@@ -305,8 +289,8 @@ public class TestScript extends GhidraScript {
     	
     	DitEmulator ditEmu = new DitEmulator(language, memState, new BreakTableCallBack(language), taintTrack);
     	ditEmu.setExecuteAddress(currentAddress);
-    	
-    	println(currentAddress.toString());
+
+    	println(taintTrack.taintSet.toString());
     	
     	while(true) {
     		if(ditEmu.getExecuteAddress().getOffset() == 0) {
@@ -315,6 +299,8 @@ public class TestScript extends GhidraScript {
     		}
     		
     		ditEmu.executeInstruction(false, monitor);
+
+        	println(taintTrack.taintSet.toString());
     		
     		if(taintTrack.ditViolationDetected) {
     			break;
