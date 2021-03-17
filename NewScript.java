@@ -22,6 +22,7 @@ import ghidra.program.model.listing.*;
 import ghidra.program.model.pcode.*;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.address.*;
+import ghidra.program.model.lang.Register;
 
 import com.google.gson.*;
 
@@ -54,8 +55,37 @@ class TaintHelper {
 		this.vmctx = vmctx;
 	}
 	
+	public boolean checkInitialTaint(Address addr, int len) {
+		if(main.contains(main.getRegister("sp"), addr, len)) {
+			return false;
+		}
+		if(main.contains(main.getRegister("x30"), addr, len)) {
+			return false;
+		}
+		
+		int funcIndex = main.currentFunctionIndex;
+		boolean[] paramSecrecy = vmctx.functions[funcIndex].paramSecrecy;
+		
+		//the first 7 arguments are passed in through x2-x8
+		for(int i = 0; i <= 6 && i < paramSecrecy.length; i++) {
+			if(main.contains(main.getRegister("x" + (2 + i)), addr, len)) {
+				return paramSecrecy[i];
+			}
+		}
+		
+		throw new RuntimeException("Cannot determine initial taintedness of: " + addr);
+	}
+	
+	public boolean checkInitialTaint(Register reg) {
+		if(reg.getLeastSignificantBit() != 0 || reg.getBitLength() % 8 != 0) {
+			throw new RuntimeException(reg + " isn't byte-aligned, can't determine initial taint");
+		}
+		
+		return checkInitialTaint(reg.getAddress(), reg.getBitLength() / 8);
+	}
+	
 	//checks if an initial Varnode (one with no source) is tainted
-	private boolean checkInitialTaint(Varnode vn) {
+	public boolean checkInitialTaint(Varnode vn) {
 		if(vn.getDef() != null) {
 			throw new IllegalArgumentException("Varnode must be initial");
 		}
@@ -63,45 +93,51 @@ class TaintHelper {
 			throw new IllegalArgumentException("Varnode must be a register");
 		}
 		
-		String description = main.getRegisterName(vn);
-		
-		if(description.equals("sp") || description.equals("x30")) {
-			return false; //the stack pointer and return address are not considered secret when the function starts running
-		}
-
-		int funcIndex = main.currentFunctionIndex;
-		boolean[] paramSecrecy = vmctx.functions[funcIndex].paramSecrecy;
-		char regPrefix = description.charAt(0);
-		
-		if(regPrefix != 'w' && regPrefix != 'x') {
-			throw new RuntimeException("Unhandled register prefix for register: " + description);
-		}
-		
-		int regIndex = Integer.parseInt(description.substring(1));
-		
-		if(regIndex == 0) {
-			return false; //the location of the vmctx is not tainted
-		}
-		
-		if(regIndex > 6 || regIndex >= paramSecrecy.length + 2) {
-			throw new RuntimeException("Unhandled register index for: " + description);
-		}
-		
-		return paramSecrecy[regIndex - 2]; //the first 6 arguments are passed in through x2-x7
+		return checkInitialTaint(vn.getAddress(), vn.getSize());
 	}
 	
-	//returns false if we are sure the value is not tainted
+	//returns false if we are sure that the register is not tainted immediately prior to op
+	public boolean checkRegisterTaint(Register reg, PcodeOp op, HashSet<PcodeOp> visited) {
+		if(visited.contains(op)) {
+			return false; //the other branch will catch the taint we are looking for
+		}
+		
+		visited.add(op);
+		
+		List<PcodeOp> predecessors = main.getPredecessors(op);
+		if(predecessors.size() == 0) {
+			return checkInitialTaint(reg);
+		}
+		boolean res = false;
+		for(PcodeOp pred: predecessors) {
+			Varnode output = pred.getOutput();
+			if(output != null && output.isRegister()) {
+				Register outputReg = main.getRegister(output);
+				if(main.intersect(reg, outputReg)) {
+					if(outputReg.contains(reg)) {
+						res |= main.isTainted(output);
+						continue;
+					}else if(reg.contains(outputReg)) {
+						res |= main.isTainted(output);
+						res |= checkRegisterTaint(reg, pred, visited);
+						continue;
+					}
+					throw new RuntimeException("output register " + outputReg + " intersects " + reg + " but does not contain it -- cannot determine taintedness");
+				}
+			}
+			res |= checkRegisterTaint(reg, pred, visited);
+		}
+		return res;
+	}
+	
+	//returns false if we are sure the value is not tainted, true otherwise
 	private boolean checkIsTainted(Varnode vn, HashSet<Varnode> visited) {
 		boolean res = false;
 		
-		if(visited.contains(vn)) { // cycle detected, but we are able to determine the true taintedness from the other check
+		if(visited.contains(vn)) { // cycle detected, but we are able to determine the true taintedness from the other branch
 			return false;
 		}
 		visited.add(vn);
-		
-		if(vn.isRegister() && main.getRegisterName(vn).equals("x30")) {
-			main.println(main.decomposeAddr(vn));
-		}
 		
 		if(vn.isConstant() || vn.isAddress()) { 
 			//constant varnode has no taint
@@ -129,11 +165,14 @@ class TaintHelper {
 				}
 			}else if(behave.getOpCode() == PcodeOp.LOAD) {
 				if(!main.isRAM(op.getInput(0))) {
-					throw new RuntimeException("Unhandled load target: " + op.getInput(0).toString());
+					throw new RuntimeException("Unhandled load target: " + op.getInput(0).toString() + " at " + main.getPcodeOpLocation(op));
 				}
-				return main.checkAddressTainted(op.getInput(1));
+				return main.memLocationTainted(op.getInput(1), op);
 			}else {
-				throw new RuntimeException("Unhandled pcode op: " + op.toString());
+				main.println(main.prettyPrint(op.getInput(0)));
+				Iterator<PcodeOp> ops = op.getParent().getIterator();
+				while(ops.hasNext()) main.println(ops.next().toString());
+				throw new RuntimeException("Unhandled pcode op: " + op.toString() + " at " + main.getPcodeOpLocation(op));
 			}
 			
 		}else{
@@ -152,10 +191,11 @@ class TaintHelper {
 class MemoryHelper {	
 	DITChecker main;
 
-	ArrayList<ASTNode> secretAddresses; 
-	// a load from this address will yield a tainted value and a store may be tainted
-	ArrayList<ASTNode> publicAddresses; 
-	// a load from this address will yield an untainted value and a store must be untainted
+	ArrayList<ASTNode> secretAddresses; // a load from this address will yield a tainted value and a store may be tainted
+	ArrayList<ASTNode> publicAddresses; // a load from this address will yield an untainted value and a store must be untainted
+	ArrayList<ASTNode> pointerAddresses; // a load from this address will yield a pointer, which is neither tainted nor untainted
+	//this prevents arithmetic from being done on a pointer, or subtracting a pointer to itself to add another pointer, etc.
+	//since calling isTainted() on a varnode that evaluates to it will lead to an exception
 	
 	ASTNode stack = new AnyOffset(new RegisterNode("sp"));
 
@@ -163,6 +203,7 @@ class MemoryHelper {
 		this.main = m;
 		secretAddresses = new ArrayList<>();
 		publicAddresses = new ArrayList<>();
+		pointerAddresses = new ArrayList<>();
 		
 		//add the global stack bound
 		publicAddresses.add(new RegisterNode("x0"));
@@ -182,9 +223,9 @@ class MemoryHelper {
 		}
 		for(int i = 0; i < vmctx.memories.length; i++) {
 			ASTNode firstPtr = new SpecificOffset(new RegisterNode("x0"), vmctx.memoriesOffset + 0x10 * i);
-			publicAddresses.add(firstPtr);
+			pointerAddresses.add(firstPtr);
 			ASTNode secondPtr = new Load(firstPtr);
-			publicAddresses.add(secondPtr);
+			pointerAddresses.add(secondPtr);
 			
 	    	ASTNode finalLevel = new AnyOffset(new Load(secondPtr));
 	    	if(vmctx.memories[i].secret) {
@@ -196,6 +237,8 @@ class MemoryHelper {
 	}
 	
 	interface ASTNode {
+		//matches is designed to be conservative -- if it returns true, we are sure the varnode matches the description
+		//if it returns false, this doesn't mean the varnode couldn't match the description, just that we're not sure
 		boolean matches(Varnode v);
 	}
 	
@@ -314,6 +357,12 @@ class MemoryHelper {
 				if(right.isConstant()) {
 					return new SpecificOffset(base, offset - right.getOffset()).matches(left);
 				}
+			}else if(op.getOpcode() == PcodeOp.INT_SUB) {
+				Varnode left = op.getInput(0);
+				Varnode right = op.getInput(1);
+				if(right.isConstant()) {
+					return new SpecificOffset(base, offset + right.getOffset()).matches(left);
+				}
 			}
 			return false;
 		}
@@ -335,7 +384,7 @@ class MemoryHelper {
 			PcodeOp op = v.getDef();
 			if(op == null) {
 				if(v.isRegister()) {
-					return registerName.equals(main.getRegisterName(v));
+					return registerName.equals(main.getRegister(v).getName());
 				}
 				return false;
 			}else if(op.getOpcode() == PcodeOp.COPY) {
@@ -346,28 +395,108 @@ class MemoryHelper {
 		}
 	}
 	
-	public SpecificOffset flattenStackAddr(Varnode v) {
+	class StackSlot {
+		long offset;
+		int size;
+		
+		public StackSlot(long o, int s) {
+			this.offset = o;
+			this.size = s;
+		}
+		
+		@Override
+		public String toString() {
+			return size + "@(sp + " + offset + ")";
+		}
+		
+		public boolean intersects(StackSlot o) {
+			return (this.offset < o.offset + o.size) && (o.offset < this.offset + this.size);
+		}
+		
+		public boolean covers(StackSlot o) {
+			return (o.offset >= this.offset) && (o.offset + o.size <= this.offset + this.size);
+		}
+	}
+	
+	public StackSlot resolveStackSlot(Varnode v, int size) {
 		if(!stack.matches(v)) {
 			throw new RuntimeException("Attempted to flatten non-stack address");
 		}
 		PcodeOp op = v.getDef();
 		if(op == null) {
-			if(!v.isRegister() || !main.getRegisterName(v).equals("sp")) {
-				throw new RuntimeException("Failed to flatten stack pointer");
+			if(!v.isRegister() || !main.getRegister(v).getName().equals("sp")) {
+				throw new RuntimeException("Failed to flatten: expected stack pointer, got " + v);
 			}
-			return new SpecificOffset(new RegisterNode("sp"), 0);
+			return new StackSlot(0, size);
 		}else if(op.getOpcode() == PcodeOp.COPY) {
-			return flattenStackAddr(op.getInput(0));
+			return resolveStackSlot(op.getInput(0), size);
 		}else if(op.getOpcode() == PcodeOp.INT_ADD) {
-			SpecificOffset lhs = flattenStackAddr(op.getInput(0));
+			StackSlot lhs = resolveStackSlot(op.getInput(0), size);
 			lhs.offset += main.resolveValue(op.getInput(1));
 			return lhs;
+		}else if(op.getOpcode() == PcodeOp.INT_SUB) {
+			StackSlot lhs = resolveStackSlot(op.getInput(0), size);
+			lhs.offset -= main.resolveValue(op.getInput(1));
+			return lhs;
 		}else {
-			throw new RuntimeException("Could not handle op " + op + " when attempting to flatten stack address");
+			throw new RuntimeException("Could not handle op " + op + " at " + main.getPcodeOpLocation(op) + " when attempting to flatten stack address");
 		}
 	}
+	
+	//checks if a stack slot is tainted at the start of the function
+	private boolean initialStackSlotIsTainted(StackSlot slot) {
+		FunctionsVmctxData function = main.vmctx.functions[main.currentFunctionIndex];
+		//all arguments after 6 are allocated a stack slot above the current frame
+		for(int i = 6; i < function.paramSecrecy.length; i++) {
+			StackSlot paramSlot = new StackSlot(8 * (i - 6), 8);
+			if(paramSlot.covers(slot)) {
+				return function.paramSecrecy[i];
+			}
+		}
+		throw new RuntimeException("Cannot determine taint of stack slot " + slot + " at start of function");
+	}
 
-	public boolean checkAddressTainted(Varnode vn) {
+	//determines whether or not the stack slot being referred to by toAddr could contain a tainted value immediately prior to when op runs
+	private boolean stackSlotContainsTaint(StackSlot toAddr, PcodeOp op, HashSet<PcodeOp> visited) {
+		if(visited.contains(op)) {
+			return false; //the other branch will catch the taint we are looking for
+		}
+		
+		visited.add(op);
+
+		boolean res = false;
+
+		List<PcodeOp> predecessors = main.getPredecessors(op);
+		if(predecessors.size() == 0) {
+			return initialStackSlotIsTainted(toAddr);
+		}
+		for(PcodeOp pred : predecessors) {
+			if(pred.getOpcode() == PcodeOp.STORE && stack.matches(pred.getInput(1))) {
+				//the predecessor is writing to the stack
+				StackSlot dest = resolveStackSlot(pred.getInput(1), pred.getInput(2).getSize());
+				if(dest.intersects(toAddr)) {
+					if(dest.covers(toAddr)) {
+						//the predecessor has overwritten our stack slot
+						res |= main.isTainted(pred.getInput(2));
+						continue; //since the stack slot was overwritten, we no longer need to continue tracing backwards
+					}
+					throw new RuntimeException("Store intersects stack slot but does not cover it: " + dest + " (stack slot " + toAddr + ")");
+				}
+			}
+			res |= stackSlotContainsTaint(toAddr, pred, visited);
+		}
+		
+		return res;
+	}
+	
+	public boolean stackSlotContainsTaint(StackSlot toAddr, PcodeOp op) {
+		return stackSlotContainsTaint(toAddr, op, new HashSet<>());
+	}
+	
+	//op is the load/store operation being performed
+	//vn is the address being loaded/stored to
+	//return true if the varnode, when interpreted as an address, points to a location that could contain a secret value
+	public boolean memLocationTainted(Varnode vn, PcodeOp op) {
 		for(ASTNode secretAddr : secretAddresses) {
 			if(secretAddr.matches(vn)) {
 				return true;
@@ -380,15 +509,41 @@ class MemoryHelper {
 		}
 		
 		if(stack.matches(vn)) {
-			main.println("Found stack match");
-			main.println(flattenStackAddr(vn).toString());
+			if(op.getOpcode() == PcodeOp.STORE) {
+				return true; //both secret and public values are allowed to be stored on the stack
+			}else if(op.getOpcode() == PcodeOp.LOAD) {
+				StackSlot stackOff = resolveStackSlot(vn, op.getOutput().getSize());
+				return stackSlotContainsTaint(stackOff, op);
+			}else {
+				throw new RuntimeException("Invalid pcode op given to memLocationTainted");
+			}
 		}
 		
-		throw new RuntimeException("Cannot resolve address: " + decomposeAddr(vn, new HashMap<>()));
+		throw new RuntimeException("Cannot resolve address: " + toASTString(vn, new HashMap<>()));
+	}
+	
+	public boolean addrWellFormed(Varnode vn) {
+		for(ASTNode secretAddr : secretAddresses) {
+			if(secretAddr.matches(vn)) {
+				return true;
+			}
+		}
+		for(ASTNode publicAddr : publicAddresses) {
+			if(publicAddr.matches(vn)) {
+				return true;
+			}
+		}
+		for(ASTNode pointer : pointerAddresses) {
+			if(pointer.matches(vn)) {
+				return true;
+			}
+		}
+		if(stack.matches(vn)) return true;
+		return false;
 	}
 	
 	int nextIdxForDecomposition = 0;
-	public String decomposeAddr(Varnode vn, HashMap<Varnode, Integer> visited) {
+	public String toASTString(Varnode vn, HashMap<Varnode, Integer> visited) {
 		if(visited.containsKey(vn)) {
 			return String.format("(%d)", visited.get(vn));
 		}
@@ -402,12 +557,12 @@ class MemoryHelper {
 			PcodeOp op = vn.getDef();
 			
 			if(op == null) {
-				res.append(vn.isRegister()? main.getRegisterName(vn) : vn.toString());
+				res.append(vn.toString(main.currentProgram.getLanguage()));
 				return res.toString();
 			}
 			
 			if(op.getOpcode() == PcodeOp.COPY) {
-				res.append(decomposeAddr(op.getInput(0), visited));
+				res.append(toASTString(op.getInput(0), visited));
 				return res.toString();
 			}
 			
@@ -416,7 +571,7 @@ class MemoryHelper {
 			res.append(" ( ");
 			
 			for(int i = 0; i < op.getNumInputs(); i++) {
-				res.append(decomposeAddr(op.getInput(i), visited));
+				res.append(toASTString(op.getInput(i), visited));
 				res.append(", ");
 			}
 			
@@ -428,6 +583,14 @@ class MemoryHelper {
 		return res.toString();
 	}
 
+	@Override
+	public String toString() {
+		StringBuilder sb = new StringBuilder();
+		sb.append("Secret addresses: " + secretAddresses + "\n");
+		sb.append("Public addresses: " + publicAddresses + "\n");
+		sb.append("Stack addresses: " + stack + "\n");
+		return sb.toString();
+	}
 }
 
 //handles information pertaining to the ARM DIT specification
@@ -513,9 +676,14 @@ class NonDITInstrCheckPass implements DITCheckPass {
 				}
 				
 				for(Varnode input : op.getInputs()) {
-					if(main.isTainted(input)) {
-						main.println("Input " + main.getRegisterName(input) + " is tainted at " + instr.getAddress().toString());
-						return false;
+					try {
+						if(main.isTainted(input)) {
+							main.println("Input " + input.toString(main.currentProgram.getLanguage()) + " is tainted at " + instr.getAddress().toString());
+							return false;
+						}
+					}catch(RuntimeException e) {
+						main.println("Failed to check taint of " + input + ", used in instruction at " + instr.getAddress());
+						throw e;
 					}
 				}
 			}
@@ -541,12 +709,25 @@ class SecretStoresCheckPass implements DITCheckPass {
 						
 			Varnode addr = op.getInput(1);
 			Varnode toStore = op.getInput(2);
-			
-			if(!main.checkAddressTainted(addr)) {
-				// we are storing to a public location
-				if(main.isTainted(toStore)) {
-					return false;
+			try {
+				if(!main.memLocationTainted(addr, op)) {
+					// we are storing to a public location
+					try {
+						if(main.isTainted(toStore)) {
+							main.println("At pcode op " + op + " at " + main.getPcodeOpLocation(op));
+							main.println("We are storing to the address " + main.toASTString(addr) + ", which is public, "
+									+ "but we are writing the value " + toStore + ", which is tainted");
+							return false;
+						}
+					}catch(RuntimeException e) {
+						main.println("Failed to check taint of " + toStore + 
+								" at " + main.getPcodeOpLocation(op));
+						throw e;
+					}
 				}
+			}catch(RuntimeException e) {
+				main.println("When analyzing op " + op + " at " + main.getPcodeOpLocation(op));
+				throw e;
 			}
 		}
 		
@@ -556,7 +737,7 @@ class SecretStoresCheckPass implements DITCheckPass {
 
 class TaintedAddrCheckPass implements DITCheckPass {
 	public String toString() {
-		return "Check that no target addresses of loads/stores are secret-dependent";
+		return "Check that target addresses of loads/stores are limited to non-secret stack locations, global variables, and memories";
 	}
 
 	@Override
@@ -571,12 +752,21 @@ class TaintedAddrCheckPass implements DITCheckPass {
 			
 			Varnode addr = op.getInput(1);
 			
-			if(main.isTainted(addr)) {
-				//we use isTainted here instead of checkAddressTainted since we are interested in
-				//whether the address's value itself is tainted, not whether the value that's supposed
-				//to be at the address is tainted
+			try {
+				if(!main.addrWellFormed(addr)) {
+					main.println("We found a load/store to the address " + main.toASTString(addr) + ", which does not match any expected format.");
+					main.println(main.mc.toString());
+					return false;
+				}
+			}catch(RuntimeException e) {
+				main.println("When analyzing op " + op + " at " + main.getPcodeOpLocation(op));
+				main.println(main.toASTString(addr));
+
+				for(Register r : main.currentProgram.getLanguage().getRegisters()) {
+					main.println(r.toString() + ": " + r.getAddress().toString());
+				}
 				
-				return false;
+				throw e;
 			}
 		}
 		
@@ -584,9 +774,60 @@ class TaintedAddrCheckPass implements DITCheckPass {
 	}
 }
 
-class TrustedFunctionCallPass implements DITCheckPass {
+class FunctionCallPass implements DITCheckPass {
 	public String toString() {
-		return "Check that a trusted function is never called by an untrusted function";
+		return "Check that a trusted function is never called by an untrusted function, and that a tainted value is never passed as public";
+	}
+	
+	//returns the first pcode op in the set of INDIRECT ops preceeding the call op
+	private PcodeOp skipIndirectOps(DITChecker main, PcodeOp callOp) {
+		PcodeOp walker = callOp;
+		while(true) {
+			List<PcodeOp> predecessors = main.getPredecessors(walker);
+			if(predecessors.size() != 1) return walker;
+			
+			PcodeOp prev = predecessors.get(0);
+			if(prev.getOpcode() != PcodeOp.INDIRECT) return walker;
+			
+			int iop = (int)prev.getInput(1).getOffset();
+			SequenceNumber seq = new SequenceNumber(main.getPcodeOpLocation(callOp), iop);
+			if(!main.currentFunction.getPcodeOp(seq).equals(callOp)) return walker;
+			
+			walker = prev;
+		}
+	}
+	
+	private boolean checkFunctionCall(DITChecker main, int functionIndex, PcodeOp callOp) {
+		FunctionsVmctxData function = main.vmctx.functions[functionIndex];
+		if(function.trusted) {
+			main.println("We found a call from untrusted function " + main.currentFunctionIndex 
+					+ " to trusted function " + functionIndex + " occuring at " + main.getPcodeOpLocation(callOp));
+			return false;
+		}
+		
+		try {
+			for(int i = 0; i < function.paramSecrecy.length; i++) {
+				if(!function.paramSecrecy[i]) {
+					if(i >= 6) {
+						main.println("Warning: skipped check for " 
+								+ i + "th parameter secrecy for function call at " + main.getPcodeOpLocation(callOp));
+						continue;
+					}
+					Register paramReg = main.getRegister("x" + (i + 2)); // the first 6 arguments are passed in through [x2, x8)
+					PcodeOp startOp = skipIndirectOps(main, callOp);
+					if(main.checkRegisterTaint(paramReg, startOp)) {
+						main.println("At " + main.getPcodeOpLocation(callOp) + 
+								", the " + i + "th argument to the function should be public but was determined to be tainted");
+						return false;
+					}
+				}
+			}
+		}catch(RuntimeException e) {
+			main.println("Error when checking function call at " + main.getPcodeOpLocation(callOp));
+			throw e;
+		}
+		
+		return true;
 	}
 
 	@Override
@@ -618,30 +859,20 @@ class TrustedFunctionCallPass implements DITCheckPass {
 					throw new RuntimeException("Cannot find function starting at " + dest.getAddress());
 				}
 				
+				int targetFuncIndex = main.indexOfFunctionAt(targetFunc.getEntryPoint());
+				
+				return checkFunctionCall(main, targetFuncIndex, op);
 			}else if(opcode == PcodeOp.CALLIND || opcode == PcodeOp.BRANCHIND) {
 				long destOff = main.resolveValue(op.getInput(0));
 				AddressSpace currentAddressSpace = main.currentFunction.getFunction().getEntryPoint().getAddressSpace();
 				Address targetAddr = currentAddressSpace.getAddress(destOff);
+				int targetFuncIndex = main.indexOfFunctionAt(targetAddr);
 				
-				if(main.funcIsTrusted(targetAddr)) {
-					return false;
-				}
+				return checkFunctionCall(main, targetFuncIndex, op);
 			}
 		}
 
 		return true;
-	}
-}
-
-class FunctionParameterPass implements DITCheckPass {
-	public String toString() {
-		return "Check that a tainted parameter is never passed to a function expecting a public value [TODO]";
-	}
-
-	@Override
-	public boolean check(DITChecker main) {
-		// TODO Auto-generated method stub
-		return false;
 	}
 }
 
@@ -650,28 +881,37 @@ class DITChecker {
 	NewScript script;
 	VmctxOffsetData vmctx;
 	Program currentProgram;
-	private TaintHelper tc;
-	private MemoryHelper mc;
+	TaintHelper tc;
+	MemoryHelper mc;
 	HighFunction currentFunction;
 	int currentFunctionIndex = -1;
+	HashMap<PcodeOp, Address> allOps; //this maps each pcode op to the address where it's located
 	
 	ArrayList<DITCheckPass> checks = new ArrayList<>();
 	{
 		checks.add(new NonDITInstrCheckPass());
 		checks.add(new TaintedAddrCheckPass());
 		checks.add(new SecretStoresCheckPass());
-		checks.add(new TrustedFunctionCallPass());
-		checks.add(new FunctionParameterPass());
+		checks.add(new FunctionCallPass());
 		//TODO: add data dependencies for function return values
-		//TODO: add checks that function inputs match the corresponding function signature
 	}
 	
 	boolean isRAM(Varnode v) {
 		return "ram".equals(currentProgram.getLanguage().getAddressFactory().getAddressSpace((int)v.getAddress().getOffset()).getName());
 	}
 	
-	String getRegisterName(Varnode v) {
-		return currentProgram.getLanguage().getRegister(v.getAddress(), v.getSize()).getName();
+	Register getRegister(Varnode v) {
+		if(!v.isRegister()) {
+			throw new IllegalArgumentException("Varnode must be register");
+		}
+		return currentProgram.getLanguage().getRegister(v.getAddress(), v.getSize());
+	}
+	
+	String prettyPrint(Varnode v) {
+		if(v.isRegister()) {
+			return getRegister(v).getName();
+		}
+		return v.toString();
 	}
 	
 	public DITChecker(Program cp, HighFunction func, VmctxOffsetData vmctx, int currentFunctionIndex, NewScript script) {
@@ -683,18 +923,103 @@ class DITChecker {
 		
 		this.tc = new TaintHelper(this, vmctx);
 		this.mc = new MemoryHelper(this, vmctx);
+		
+		this.allOps = new HashMap<>();
+		Iterator<AddressRange> addressRanges = func.getFunction().getBody().iterator();
+		while(addressRanges.hasNext()) {
+			Iterator<Address> range = addressRanges.next().iterator();
+			while(range.hasNext()) {
+				Address addr = range.next();
+				Iterator<PcodeOpAST> ops = func.getPcodeOps(addr);
+				while(ops.hasNext()) {
+					allOps.put(ops.next(), addr);
+				}
+			}
+		}
 	}
 	
-	public boolean checkAddressTainted(Varnode vn) {
-		return mc.checkAddressTainted(vn);
+	public Address getPcodeOpLocation(PcodeOp op) {
+		return allOps.getOrDefault(op, null);
+	}
+	
+	public boolean memLocationTainted(Varnode vn, PcodeOp loadOp) {
+		return mc.memLocationTainted(vn, loadOp);
+	}
+	
+	public boolean addrWellFormed(Varnode vn) {
+		return mc.addrWellFormed(vn);
 	}
 	
 	public boolean isTainted(Varnode vn) {
 		return tc.isTainted(vn);
 	}
 	
-	public String decomposeAddr(Varnode vn) {
-		return mc.decomposeAddr(vn, new HashMap<>());
+	public boolean checkRegisterTaint(Register reg, PcodeOp op) {
+		return tc.checkRegisterTaint(reg, op, new HashSet<>());
+	}
+	
+	public String toASTString(Varnode vn) {
+		mc.nextIdxForDecomposition = 0;
+		return mc.toASTString(vn, new HashMap<>());
+	}
+	
+	//get the pcode op's that may have executed before the current one
+	public List<PcodeOp> getPredecessors(PcodeOp op) {
+		ArrayList<PcodeOp> res = new ArrayList<>();
+
+		PcodeBlockBasic block = op.getParent();
+		SequenceNumber seqnum = op.getSeqnum();
+		if(seqnum.getOrder() != 0) { 
+			//since this is a basic block, the only possible predecessor is the one preceeding this one in the block
+			Iterator<PcodeOp> ops = block.getIterator();
+			PcodeOp prev = null, next = null;
+			for(int i = 0; i <= seqnum.getOrder(); i++) {
+				prev = next;
+				next = ops.next();
+			}
+
+			assert(next.equals(op));
+			assert(prev != null);
+
+			res.add(prev);
+		}else {
+			int insize = block.getInSize();
+			for(int i = 0; i < insize; i++) {
+				PcodeBlockBasic prevBlock = (PcodeBlockBasic)block.getIn(i);
+				Iterator<PcodeOp> ops = prevBlock.getIterator();
+				PcodeOp last = null;
+				while(ops.hasNext()) {
+					last = ops.next();
+				}
+
+				res.add(last);
+			}
+		}
+
+		return res;
+	}
+	
+	public Register getRegister(String name) {
+		return currentProgram.getLanguage().getRegister(name);
+	}
+	
+	public boolean intersect(Register a, Register b) {
+		long a1 = a.getOffset() * 8 + a.getLeastSignificantBit();
+		long b1 = b.getOffset() * 8 + b.getLeastSignificantBit();
+		long a2 = a1 + a.getBitLength();
+		long b2 = b1 + b.getBitLength();
+		
+		return a1 < b2 && b1 < a2;
+	}
+	
+	public boolean contains(Register a, Address b, int bLen) {
+		if(a.getBitLength() % 8 != 0 || a.getLeastSignificantBit() != 0) {
+			throw new RuntimeException("Register " + a.toString() + " is not byte-aligned, cannot determine if it contains " + b.toString());
+		}
+		
+		return a.getAddressSpace().equals(b.getAddressSpace())
+				&& a.getOffset() <= b.getOffset()
+				&& a.getOffset() + a.getBitLength() / 8 >= b.getOffset() + bLen;
 	}
 	
 	//attempts to resolve the exact value of a varnode statically
@@ -725,11 +1050,11 @@ class DITChecker {
 		throw new RuntimeException("Failed to resolve varnode value");
 	}
 	
-	//given a function entry point, tells you if this function is marked as "trusted"
-	public boolean funcIsTrusted(Address entry) {
+	//returns the function index for the function given its entry point
+	public int indexOfFunctionAt(Address entry) {
 		for(int i = 0; i < vmctx.functions.length; i++) {
 			if(script.getWasmFunction(i).getEntryPoint().equals(entry)) {
-				return vmctx.functions[i].trusted;
+				return i;
 			}
 		}
 		throw new RuntimeException("Could not find wasm function at address " + entry);
@@ -744,7 +1069,7 @@ class DITChecker {
 	}
 	
 	public void performChecks() {
-		println("Running checks for function " + currentFunctionIndex);
+		println("Running checks for function " + currentFunctionIndex + " at " + currentFunction.getFunction().getEntryPoint());
 		
 		if(vmctx.functions[currentFunctionIndex].trusted) {
 			println("Skipping checks since this function is trusted");
@@ -761,6 +1086,7 @@ public class NewScript extends GhidraScript {
 	
 	private HighFunction decompileFunction(Function f) {
     	DecompileOptions options = new DecompileOptions();
+    	options.setWARNCommentIncluded(true);
     	DecompInterface ifc = new DecompInterface();
     	ifc.setOptions(options);
     	
@@ -771,6 +1097,7 @@ public class NewScript extends GhidraScript {
     	ifc.setSimplificationStyle("firstpass");
     	
     	DecompileResults res = ifc.decompileFunction(f, 30, null);
+    	
         return res.getHighFunction();
 	}
 	
