@@ -169,9 +169,7 @@ class TaintHelper {
 				}
 				return main.memLocationTainted(op.getInput(1), op);
 			}else {
-				main.println(main.prettyPrint(op.getInput(0)));
 				Iterator<PcodeOp> ops = op.getParent().getIterator();
-				while(ops.hasNext()) main.println(ops.next().toString());
 				throw new RuntimeException("Unhandled pcode op: " + op.toString() + " at " + main.getPcodeOpLocation(op));
 			}
 			
@@ -737,7 +735,7 @@ class SecretStoresCheckPass implements DITCheckPass {
 
 class TaintedAddrCheckPass implements DITCheckPass {
 	public String toString() {
-		return "Check that target addresses of loads/stores are limited to non-secret stack locations, global variables, and memories";
+		return "Check that target addresses of loads/stores are not secret-dependent and fit expectations";
 	}
 
 	@Override
@@ -1068,17 +1066,28 @@ class DITChecker {
 		script.print(s);
 	}
 	
-	public void performChecks() {
+	public boolean performChecks() {
 		println("Running checks for function " + currentFunctionIndex + " at " + currentFunction.getFunction().getEntryPoint());
 		
 		if(vmctx.functions[currentFunctionIndex].trusted) {
 			println("Skipping checks since this function is trusted");
-			return;
+			return true;
 		}
 		
+		boolean res = true;
 		for(DITCheckPass check : checks) {
-			println(check.toString() + ": " + (check.check(this)? "PASS": "FAIL"));
+			try {
+				boolean subRes = check.check(this);
+				println("\t" + check.toString() + ": " + (subRes? "PASS": "FAIL"));
+				res &= subRes;
+			}catch(Exception e) {
+				println(check.toString() + ": " + "EXCEPT");
+				e.printStackTrace();
+				res = false;
+			}
 		}
+		
+		return res;
 	}
 }
 
@@ -1157,15 +1166,20 @@ public class NewScript extends GhidraScript {
     	
     	VmctxOffsetData vmoffs = gson.fromJson(new String(vmoffData), VmctxOffsetData.class);
     	
+    	boolean result = true;
     	for(int i = 0; i < vmoffs.functions.length; i++) {
     		Function func = getWasmFunction(i);
     		HighFunction highFunc = decompileFunction(func);
     		
     		DITChecker ditChecker = new DITChecker(currentProgram, highFunc, vmoffs, i, this);
-    		ditChecker.performChecks();
+    		result &= ditChecker.performChecks();
     	}
     	
-    	
+    	if(result) {
+    		println("VERDICT: Program admitted");
+    	}else {
+    		println("VERDICT: Program rejected");
+    	}
     }
 
 }

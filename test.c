@@ -15,9 +15,23 @@ int bad_secretLoop(int sec) {
     return res;
 }
 
+void good_zeroLoop(char *secBuf) {
+    for(int i = 0; i < 100; i++) {
+        secBuf[i] = 0;
+    }
+}
+
+double bad_castToFloat(int sec) {
+    return (double)sec + 1.5;
+}
+
 int good_publicLoop(int sec, int pub) {
     int res = 0;
     for(int i = 0; i < pub; i++) {
+        if(i == 100000) {
+            for(int j = 0; j < sec; j++);
+        }
+        
         res += sec;
         res += i;
     }
