@@ -17,10 +17,10 @@ $(BAD_OUT) : %.out : %.subst %.o Makefile
 	./do_substitution.sh $*
 
 $(GOOD_RESULT) : %.res : %.o Makefile
-	((./run_check.sh $*.o | grep "VERDICT: Program admitted") && echo "$* -- PASS") || echo "$* -- FAIL"
+	((./run_check.sh $*.o 2>/dev/null | grep "VERDICT: Program admitted" > /dev/null) && echo "$* -- PASS") || echo "$* -- FAIL"
 
 $(BAD_RESULT) : %.res : %.out Makefile
-	((./run_check.sh $*.out | grep "VERDICT: Program rejected") && echo "$* -- PASS") || echo "$* -- FAIL"
+	((./run_check.sh $*.out 2>/dev/null | grep "VERDICT: Program rejected" > /dev/null) && echo "$* -- PASS") || echo "$* -- FAIL"
 
 test: $(BAD_RESULT) $(GOOD_RESULT);
 

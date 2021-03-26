@@ -1,6 +1,5 @@
 (
-    docker run --init -it --rm \
-    --name ghidra \
+    docker run --init --rm \
     --cpus 4 \
     --memory 4g \
     -e MAXMEM=4G \

@@ -168,6 +168,17 @@ class TaintHelper {
 					throw new RuntimeException("Unhandled load target: " + op.getInput(0).toString() + " at " + main.getPcodeOpLocation(op));
 				}
 				return main.memLocationTainted(op.getInput(1), op);
+			}else if(behave.getOpCode() == PcodeOp.INDIRECT){
+				int iop = (int)op.getInput(1).getOffset(); //iop of instruction causing indirect effect
+				SequenceNumber iopSeq = new SequenceNumber(op.getSeqnum().getTarget(), iop);
+				int destFuncIdx = main.resolveFunctionCall(main.currentFunction.getPcodeOp(iopSeq));
+				FunctionsVmctxData destFunc = main.vmctx.functions[destFuncIdx];
+				
+				if(main.contains(main.getRegister("x0"), op.getOutput().getAddress(), op.getOutput().getSize())) {
+					//the affected varnode is contained within x0, meaning its taint is derived from the destination function's return value
+					return destFunc.returnSecrecy[0];
+				}
+				throw new RuntimeException("Unhandled pcode op: " + op.toString() + " at " + main.getPcodeOpLocation(op));
 			}else {
 				Iterator<PcodeOp> ops = op.getParent().getIterator();
 				throw new RuntimeException("Unhandled pcode op: " + op.toString() + " at " + main.getPcodeOpLocation(op));
@@ -837,41 +848,27 @@ class FunctionCallPass implements DITCheckPass {
 		
 		while(ops.hasNext()) {
 			PcodeOpAST op = ops.next();
-			int opcode = op.getOpcode();
-			if(opcode == PcodeOp.CALL
-			   || opcode == PcodeOp.BRANCH
-			   || opcode == PcodeOp.CBRANCH) {
-				Varnode dest = op.getInput(0);
-				
-				if(dest.isConstant()) {
-					//pcode-relative branching, this is a branch within the same instruction
-					continue;
-				}
-				if(main.currentFunction.getFunction().getBody().contains(dest.getAddress())) {
-					//this is a branch within the function, nothing to see here
-					continue;
-				}
-				Function targetFunc = main.currentProgram.getFunctionManager().getFunctionAt(dest.getAddress());
-				
-				if(targetFunc == null) {
-					throw new RuntimeException("Cannot find function starting at " + dest.getAddress());
-				}
-				
-				int targetFuncIndex = main.indexOfFunctionAt(targetFunc.getEntryPoint());
-				
-				return checkFunctionCall(main, targetFuncIndex, op);
-			}else if(opcode == PcodeOp.CALLIND || opcode == PcodeOp.BRANCHIND) {
-				long destOff = main.resolveValue(op.getInput(0));
-				AddressSpace currentAddressSpace = main.currentFunction.getFunction().getEntryPoint().getAddressSpace();
-				Address targetAddr = currentAddressSpace.getAddress(destOff);
-				int targetFuncIndex = main.indexOfFunctionAt(targetAddr);
-				
-				return checkFunctionCall(main, targetFuncIndex, op);
-			}
+			if(!main.isFunctionCall(op)) continue;
+			int funcIdx = main.resolveFunctionCall(op);
+			if(funcIdx == DITChecker.BRANCH_SAME_FUNCTION) continue;
+			return checkFunctionCall(main, funcIdx, op);
 		}
 
 		return true;
 	}
+}
+
+class ReturnValuePass implements DITCheckPass {
+	public String toString() {
+		return "Check that a function never returns a secret value as public [TODO]";
+	}
+
+	@Override
+	public boolean check(DITChecker main) {
+		// TODO Auto-generated method stub
+		return false;
+	}
+	
 }
 
 //encapsulates everything needed to verify a single function
@@ -883,7 +880,6 @@ class DITChecker {
 	MemoryHelper mc;
 	HighFunction currentFunction;
 	int currentFunctionIndex = -1;
-	HashMap<PcodeOp, Address> allOps; //this maps each pcode op to the address where it's located
 	
 	ArrayList<DITCheckPass> checks = new ArrayList<>();
 	{
@@ -912,6 +908,59 @@ class DITChecker {
 		return v.toString();
 	}
 	
+	boolean isFunctionCall(PcodeOp op) {
+		switch(op.getOpcode()) {
+		case PcodeOp.BRANCH:
+		case PcodeOp.CALL:
+		case PcodeOp.CBRANCH:
+		case PcodeOp.BRANCHIND:
+		case PcodeOp.CALLIND:
+			return true;
+		default:
+			return false;
+		}
+	}
+	
+	public static final int BRANCH_SAME_FUNCTION = -1;
+	//non-negative return value: the index of the function in the vmctx
+	//-1: branch within the same function
+	int resolveFunctionCall(PcodeOp callOp) {
+		switch(callOp.getOpcode()) {
+		case PcodeOp.BRANCH:
+		case PcodeOp.CALL:
+		case PcodeOp.CBRANCH:{
+			Varnode dest = callOp.getInput(0);
+			if(dest.isConstant()) {
+				//pcode-relative branching, this is a branch within the same instruction
+				return BRANCH_SAME_FUNCTION;
+			}
+			if(currentFunction.getFunction().getBody().contains(dest.getAddress())) {
+				//this is a branch within the function, nothing to see here
+				return BRANCH_SAME_FUNCTION;
+			}
+			Function targetFunc = currentProgram.getFunctionManager().getFunctionAt(dest.getAddress());
+			
+			if(targetFunc == null) {
+				throw new RuntimeException("Cannot find function starting at " + dest.getAddress());
+			}
+			
+			int targetFuncIndex = indexOfFunctionAt(targetFunc.getEntryPoint());
+			return targetFuncIndex;
+		}
+		case PcodeOp.BRANCHIND:
+		case PcodeOp.CALLIND:{
+			long destOff = resolveValue(callOp.getInput(0));
+			AddressSpace currentAddressSpace = currentFunction.getFunction().getEntryPoint().getAddressSpace();
+			Address targetAddr = currentAddressSpace.getAddress(destOff);
+			int targetFuncIndex = indexOfFunctionAt(targetAddr);
+			
+			return targetFuncIndex;
+		}
+		default:
+			throw new RuntimeException("Cannot resolve function call at " + this.getPcodeOpLocation(callOp) + ": " + callOp);
+		}
+	}
+	
 	public DITChecker(Program cp, HighFunction func, VmctxOffsetData vmctx, int currentFunctionIndex, NewScript script) {
 		this.currentProgram = cp;
 		this.currentFunction = func;
@@ -921,23 +970,10 @@ class DITChecker {
 		
 		this.tc = new TaintHelper(this, vmctx);
 		this.mc = new MemoryHelper(this, vmctx);
-		
-		this.allOps = new HashMap<>();
-		Iterator<AddressRange> addressRanges = func.getFunction().getBody().iterator();
-		while(addressRanges.hasNext()) {
-			Iterator<Address> range = addressRanges.next().iterator();
-			while(range.hasNext()) {
-				Address addr = range.next();
-				Iterator<PcodeOpAST> ops = func.getPcodeOps(addr);
-				while(ops.hasNext()) {
-					allOps.put(ops.next(), addr);
-				}
-			}
-		}
 	}
 	
 	public Address getPcodeOpLocation(PcodeOp op) {
-		return allOps.getOrDefault(op, null);
+		return op.getSeqnum().getTarget();
 	}
 	
 	public boolean memLocationTainted(Varnode vn, PcodeOp loadOp) {
@@ -1165,7 +1201,7 @@ public class NewScript extends GhidraScript {
     	vmoffBlock.getBytes(vmoffBlock.getStart(), vmoffData);
     	
     	VmctxOffsetData vmoffs = gson.fromJson(new String(vmoffData), VmctxOffsetData.class);
-    	
+    	    	
     	boolean result = true;
     	for(int i = 0; i < vmoffs.functions.length; i++) {
     		Function func = getWasmFunction(i);
