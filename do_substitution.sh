@@ -2,7 +2,7 @@
 
 SUBST_FILE=$1.subst
 O_FILE=$1.o
-OUT_FILE=$1.out
+OUT_FILE=$1.osub
 
 FIRST_LINE=`sed -n "1p" < $SUBST_FILE`
 SECOND_LINE=`sed -n "2p" < $SUBST_FILE`
