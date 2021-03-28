@@ -1,0 +1,2 @@
+{"functions":[{"paramSecrecy":[false],"returnSecrecy":[false],"trusted":false}],"globalsOffset":64,"globalsSecrecy":[],"memories":[{"imported":true,"secret":false}],"memoriesOffset":28}
+{"functions":[{"paramSecrecy":[false],"returnSecrecy":[false],"trusted":false}],"globalsOffset":64,"globalsSecrecy":[],"memories":[{"imported":true,"secret":true}],"memoriesOffset":28} 

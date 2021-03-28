@@ -17,12 +17,12 @@ $(BAD_OBJS) : %.osub : %.subst %.o Makefile
 	./do_substitution.sh $*
 
 $(GOOD_RESULT) : %.res : %.o Makefile
-	((./run_check.sh $*.o 2>/dev/null | grep "VERDICT: Program admitted" > /dev/null) && echo "$* -- PASS") || echo "$* -- FAIL"
+	((./run_check.sh $*.o 2>&1 | tee $*.res | grep "VERDICT: Program admitted" > /dev/null) && echo "$* -- PASS") || echo "$* -- FAIL"
 
 $(BAD_RESULT) : %.res : %.osub Makefile
-	((./run_check.sh $*.osub 2>/dev/null | grep "VERDICT: Program rejected" > /dev/null) && echo "$* -- PASS") || echo "$* -- FAIL"
+	((./run_check.sh $*.osub 2>&1 | tee $*.res | grep "VERDICT: Program rejected" > /dev/null) && echo "$* -- PASS") || echo "$* -- FAIL"
 
 test: $(BAD_RESULT) $(GOOD_RESULT);
 
 clean:
-	rm -f $(GOOD_OBJ) $(BAD_OBJ) $(BAD_OBJS)
+	rm -f $(GOOD_OBJ) $(BAD_OBJ) $(BAD_OBJS) $(GOOD_RESULT) $(BAD_RESULT)

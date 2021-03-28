@@ -1,6 +1,6 @@
 (
     docker run --init --rm \
-    --cpus 4 \
+    --cpus 1 \
     --memory 4g \
     -e MAXMEM=4G \
     -v `pwd`:/dit \
