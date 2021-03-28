@@ -860,15 +860,64 @@ class FunctionCallPass implements DITCheckPass {
 
 class ReturnValuePass implements DITCheckPass {
 	public String toString() {
-		return "Check that a function never returns a secret value as public [TODO]";
+		return "Check that a function never returns a secret value as public";
 	}
 
 	@Override
 	public boolean check(DITChecker main) {
-		// TODO Auto-generated method stub
-		return false;
+		HighFunction func = main.currentFunction;
+		Iterator<PcodeOpAST> ops = func.getPcodeOps();
+		
+		while(ops.hasNext()) {
+			PcodeOpAST op = ops.next();
+			if(op.getOpcode() != PcodeOp.RETURN) continue;
+			if(main.isInvalidInstruction(op)) {
+				continue; 
+				// traps are handled by another pass and do not represent a flow of information through the return value
+			}
+			
+			int functionIndex = main.currentFunctionIndex;
+			FunctionsVmctxData function = main.vmctx.functions[functionIndex];
+			for(int i = 0; i < function.returnSecrecy.length; i++) {
+				if(function.returnSecrecy[i]) continue; // return value is secret, no need to check taintedness
+				if(i > 0) {
+					main.println("Warning: skipping check for " + i + "th return value of this function.");
+					continue;
+				}
+				if(main.checkRegisterTaint(main.getRegister("x0"), op)) {
+					//we are returning a tainted value as a public return value
+					return false;
+				}
+			}
+		}
+
+		return true;
+	}
+}
+
+class InvalidInstructionPass implements DITCheckPass {
+	public String toString() {
+		return "Check that no invalid instructions exist other than a stack overflow trap";
 	}
 	
+	@Override
+	public boolean check(DITChecker main) {
+		HighFunction func = main.currentFunction;
+		Iterator<PcodeOpAST> ops = func.getPcodeOps();
+		
+		while(ops.hasNext()) {
+			PcodeOpAST op = ops.next();
+			if(main.isInvalidInstruction(op)) {
+				if(main.isStackOverflowTrap(op)) continue;
+				
+				main.println("Found invalid instruction at " + op.getSeqnum().getTarget());
+				
+				return false;
+			}
+		}
+		
+		return true;
+	}
 }
 
 //encapsulates everything needed to verify a single function
@@ -881,13 +930,16 @@ class DITChecker {
 	HighFunction currentFunction;
 	int currentFunctionIndex = -1;
 	
+	public static final int STACK_OVERFLOW_TRAP = 0xd4a00000; // the undefined instruction wasmtime uses for stack overflow traps
+	
 	ArrayList<DITCheckPass> checks = new ArrayList<>();
 	{
 		checks.add(new NonDITInstrCheckPass());
 		checks.add(new TaintedAddrCheckPass());
 		checks.add(new SecretStoresCheckPass());
 		checks.add(new FunctionCallPass());
-		//TODO: add data dependencies for function return values
+		checks.add(new ReturnValuePass());
+		checks.add(new InvalidInstructionPass());
 	}
 	
 	boolean isRAM(Varnode v) {
@@ -1084,6 +1136,23 @@ class DITChecker {
 		throw new RuntimeException("Failed to resolve varnode value");
 	}
 	
+	//check if the pcode op is part of an invalid instruction
+	//in other words, does ghidra consider this instruction as outside of the function body
+	//invalid ops like traps get synthesized into constant returns
+	public boolean isInvalidInstruction(PcodeOp op) {
+		return !currentFunction.getFunction().getBody().contains(op.getSeqnum().getTarget());
+	}
+	
+	//returns true if the op under question is part of a stack overflow trap as defined by wasmtime
+	public boolean isStackOverflowTrap(PcodeOp op) {
+		try {
+			return currentProgram.getMemory().getInt(op.getSeqnum().getTarget()) == STACK_OVERFLOW_TRAP; 
+		}catch(MemoryAccessException e) {
+			//this should never happen, since we would have gotten this op by reading from memory
+			throw new RuntimeException("Could not read memory corresponding to " + op + " at " + op.getSeqnum().getTarget());
+		}
+	}
+	
 	//returns the function index for the function given its entry point
 	public int indexOfFunctionAt(Address entry) {
 		for(int i = 0; i < vmctx.functions.length; i++) {
@@ -1117,7 +1186,7 @@ class DITChecker {
 				println("\t" + check.toString() + ": " + (subRes? "PASS": "FAIL"));
 				res &= subRes;
 			}catch(Exception e) {
-				println(check.toString() + ": " + "EXCEPT");
+				println("\t" + check.toString() + ": " + "EXCEPT");
 				e.printStackTrace();
 				res = false;
 			}
@@ -1206,7 +1275,6 @@ public class NewScript extends GhidraScript {
     	for(int i = 0; i < vmoffs.functions.length; i++) {
     		Function func = getWasmFunction(i);
     		HighFunction highFunc = decompileFunction(func);
-    		
     		DITChecker ditChecker = new DITChecker(currentProgram, highFunc, vmoffs, i, this);
     		result &= ditChecker.performChecks();
     	}
