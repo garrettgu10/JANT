@@ -1237,7 +1237,6 @@ public class NewScript extends GhidraScript {
 
 					curr = curr.add(instr.getLength());
 				} catch (Exception e) {
-					// TODO Auto-generated catch block
 					e.printStackTrace();
 				}
 			}

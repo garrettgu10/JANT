@@ -1,5 +1,5 @@
 (module
-  (import "js" "memory" (memory 2))
+  (import "js" "memory" (memory 1 2))
 
   (func $get untrusted (param $addr i32)
     (result i32)
