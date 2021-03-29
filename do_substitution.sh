@@ -10,7 +10,7 @@ SECOND_LINE=`sed -n "2p" < $SUBST_FILE`
 if [[ $(echo -n "$FIRST_LINE" | wc -c) != $(echo -n "$SECOND_LINE" | wc -c) ]]
 then
     echo "substitution file's line lengths mismatch"
-    exit
+    exit 1
 fi
 
 bbe -e "s/$FIRST_LINE/$SECOND_LINE/g" $O_FILE > $OUT_FILE
