@@ -130,6 +130,23 @@ class TaintHelper {
 		return res;
 	}
 	
+	//check if there may be implicit taint due to pcode relative branching
+	private boolean checkImplicitTaint(PcodeOp multieq) {
+		Iterator<PcodeOpAST> it = main.currentFunction.getPcodeOps(multieq.getSeqnum().getTarget());
+		// get all the pcode ops that form the same instruction
+		while(it.hasNext()) {
+			PcodeOpAST op = it.next();
+			if(op.getOpcode() != PcodeOp.CBRANCH) continue;
+			if(!op.getInput(0).isConstant()) {
+				continue; 
+				//this is not a pcode-relative branch, so this is already filtered out by a different check
+			}
+			
+			return main.isTainted(op.getInput(1));
+		}
+		return false;
+	}
+	
 	//returns false if we are sure the value is not tainted, true otherwise
 	private boolean checkIsTainted(Varnode vn, HashSet<Varnode> visited) {
 		boolean res = false;
@@ -160,6 +177,7 @@ class TaintHelper {
 					res |= checkIsTainted(input, visited);
 				}
 			}else if(behave.getOpCode() == PcodeOp.MULTIEQUAL) {
+				res |= checkImplicitTaint(op);
 				for(Varnode input : op.getInputs()) {
 					res |= checkIsTainted(input, visited);
 				}
@@ -920,6 +938,31 @@ class InvalidInstructionPass implements DITCheckPass {
 	}
 }
 
+class ConditionalBranchPass implements DITCheckPass {
+	public String toString() {
+		return "Check that no inter-instruction conditional branching is secret-dependent";
+	}
+
+	@Override
+	public boolean check(DITChecker main) {
+		HighFunction func = main.currentFunction;
+		Iterator<PcodeOpAST> ops = func.getPcodeOps();
+		
+		while(ops.hasNext()) {
+			PcodeOpAST op = ops.next();
+			if(op.getOpcode() != PcodeOp.CBRANCH) continue;
+			if(op.getInput(0).isConstant()) continue; //this is an intra-instruction branch
+			if(main.isTainted(op.getInput(1))) {
+				main.println("Found conditional branching at " + op.getSeqnum().getTarget());
+				
+				return false;
+			}
+		}
+		
+		return true;
+	}
+}
+
 //encapsulates everything needed to verify a single function
 class DITChecker {
 	NewScript script;
@@ -940,6 +983,7 @@ class DITChecker {
 		checks.add(new FunctionCallPass());
 		checks.add(new ReturnValuePass());
 		checks.add(new InvalidInstructionPass());
+		checks.add(new ConditionalBranchPass());
 	}
 	
 	boolean isRAM(Varnode v) {
