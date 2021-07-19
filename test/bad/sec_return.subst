@@ -1,2 +1,2 @@
-{"functions":[{"paramSecrecy":[],"returnSecrecy":[false],"trusted":false},{"paramSecrecy":[],"returnSecrecy":[false],"trusted":false}],"globalsOffset":64,"globalsSecrecy":[],"memories":[{"imported":true,"secret":false}],"memoriesOffset":28}
-{"functions":[{"paramSecrecy":[],"returnSecrecy":[false],"trusted":false},{"paramSecrecy":[],"returnSecrecy":[true],"trusted":false}],"globalsOffset":64,"globalsSecrecy":[],"memories":[{"imported":true,"secret":false}],"memoriesOffset":28} 
+{"functions":[{"paramSecrecy":[],"returnSecrecy":[false],"trusted":false},{"paramSecrecy":[],"returnSecrecy":[false],"trusted":false}],"globalsOffset":80,"globalsSecrecy":[],"memories":[{"imported":true,"secret":false}],"memoriesOffset":36}
+{"functions":[{"paramSecrecy":[],"returnSecrecy":[false],"trusted":false},{"paramSecrecy":[],"returnSecrecy":[true],"trusted":false}],"globalsOffset":80,"globalsSecrecy":[],"memories":[{"imported":true,"secret":false}],"memoriesOffset":36} 
